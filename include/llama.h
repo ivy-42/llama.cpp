@@ -423,6 +423,13 @@ extern "C" {
         int64_t target_size;                                        // target file size in bytes
         const char * state_file;                                    // pointer to bpw state file
         bool upgrade_tensors;                                       // enable greedy upgrade of tensors to fill remaining budget after selecting Pareto-optimal quant mix
+        float speed_importance;                                     // linear weight balancing quantization error vs inference speed
+                                                                    // 0 disables speed optimization; higher values prioritize faster inference
+                                                                    // e.g., 0.1 means 1 unit of dequant_cost is worth 0.1 units of quantization error
+        const void * dequant_costs;                                 // pointer to a std::unordered_map<ggml_type, double> holding per-element dequant time for each quant type
+                                                                    // the values only need to be proportional to each other (unit-less)
+        float embedding_activeness;                                 // multiplier for token embedding activeness (default: 1.0)
+                                                                    // replaces the '1' in '1 / vocab_size' to scale how much of the embedding is accessed per token
     } llama_model_quantize_params;
 
     typedef struct llama_logit_bias {

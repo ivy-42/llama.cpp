@@ -687,6 +687,8 @@ static std::unordered_map<std::string, ggml_type> target_bpw_type(
         double error = 0.0;
         double mse = 0.0;
         double wce = 0.0;
+        double dequant_cost = 0.0; // total per-tensor inference cost contribution for this quant type (unit-less)
+        double penalty = 0.0;      // combined error/speed score used by the optimizer
     };
 
     // Tensor quantization type choice
@@ -730,10 +732,44 @@ static std::unordered_map<std::string, ggml_type> target_bpw_type(
 
     constexpr double EPSILON = 1e-12;
     constexpr double INFINITE = std::numeric_limits<double>::infinity();
-    constexpr uint64_t STATE_MAGIC = 0x4250572d5631; // "BPW-V1"
+    constexpr uint64_t STATE_MAGIC = 0x4250572d5632; // "BPW-V2"
     constexpr uint64_t HASH_MAGIC = 0xeabada55cafed00d;
     constexpr float boost = 2.5f;
     const char * func = __func__;
+
+    // Speed-aware optimization parameters (see include/llama.h for semantics).
+    const auto * dequant_costs = static_cast<const std::unordered_map<ggml_type, double> *>(qs.params->dequant_costs);
+    const double speed_importance = (double)qs.params->speed_importance;
+
+    // Activeness ratio: fraction of tensor elements that actually contribute to a token's forward pass.
+    //   - token embedding   : only one row per token is read         -> 1 / n_vocab
+    //   - MoE expert tensors: only the routed experts are active     -> n_expert_used / n_expert
+    //   - everything else   :                                            1.0
+    auto compute_activeness = [&](const ggml_tensor * tensor) -> double {
+        if (tensor_name_match_token_embd(tensor->name)) {
+            // Only a single row per token is read from the embedding matrix.
+            // The vocabulary isn't loaded at quantization time, but the embedding tensor is always
+            // shaped [n_embd, n_vocab], so the number of rows is the vocabulary size.
+            const int64_t n_vocab = tensor->ne[1];
+            return n_vocab > 0 ? qs.params->embedding_activeness / (double)n_vocab : 1.0;
+        }
+        if (tensor->ne[2] > 1) {
+            const uint32_t n_experts = qs.model.hparams.n_expert;
+            const uint32_t n_used    = qs.model.hparams.n_expert_used;
+            if (n_experts > 0 && n_used > 0 && n_used <= n_experts) {
+                return (double)n_used / (double)n_experts;
+            }
+        }
+        return 1.0;
+    };
+
+    // Per-element inference cost for a given quant type. When no speed file is provided (or the type
+    // is missing from it) fall back to 1.0 so that the penalty collapses to the plain error metric.
+    auto lookup_base_speed = [&](ggml_type t) -> double {
+        if (!dequant_costs) { return 1.0; }
+        auto it = dequant_costs->find(t);
+        return it != dequant_costs->end() ? it->second : 1.0;
+    };
 
     // Tensor size in bytes for a given type
     auto tensor_bytes = [](const ggml_tensor * gt, const ggml_type gq) -> size_t {
@@ -863,6 +899,7 @@ static std::unordered_map<std::string, ggml_type> target_bpw_type(
                 ofs.write((const char *)& c.bpw, sizeof(c.bpw));
                 ofs.write((const char *)& bt, sizeof(bt));
                 ofs.write((const char *)& c.error, sizeof(c.error));
+                ofs.write((const char *)& c.dequant_cost, sizeof(c.dequant_cost));
             }
         }
 
@@ -937,6 +974,7 @@ static std::unordered_map<std::string, ggml_type> target_bpw_type(
                 ifs.read((char *)& b, sizeof(b));
                 cd.bytes = (size_t)b;
                 ifs.read((char *)& cd.error, sizeof(cd.error));
+                ifs.read((char *)& cd.dequant_cost, sizeof(cd.dequant_cost));
             }
 
             out.emplace(std::move(name), std::move(si));
@@ -1235,6 +1273,22 @@ static std::unordered_map<std::string, ggml_type> target_bpw_type(
 
     std::unordered_map<std::string, type_choice> bpw_data;
     if (qs.params->state_file && !checkpoint_file.empty()) { bpw_data = load_state(); }
+
+    // Recompute dequant_cost (and hence the combined penalty) for every candidate of a tensor.
+    // This is called both when candidates are built fresh and when restored from a state file,
+    // because the speed file / speed_importance may have changed between runs.
+    auto apply_speed_metrics = [&](type_choice & tc) {
+        const ggml_tensor * tensor = tc.w->tensor;
+        const double activeness = compute_activeness(tensor);
+        for (auto & c : tc.candidates) {
+            c.dequant_cost = lookup_base_speed(c.type) * (double)tc.n_elements * activeness;
+            // Linear Weighting: minimize (error + speed_importance * dequant_cost)
+            // Equivalent to maximizing (similarity - speed_importance * dequant_cost).
+            // speed_importance is a linear weight balancing error vs inference speed.
+            // E.g., speed_importance=0.1 means 1 unit of dequant_cost is worth 0.1 units of error.
+            c.penalty = c.error + speed_importance * c.dequant_cost;
+        }
+    };
 
     auto has_side_data = [&](const auto * m, const std::string & name, const int64_t n2, const int64_t n_per_row) {
         if (!m) { return false; }
@@ -1752,6 +1806,7 @@ static std::unordered_map<std::string, ggml_type> target_bpw_type(
             tc.min_bpw = tn->second.min_bpw;
             tc.max_bpw = tn->second.max_bpw;
             tc.n_elements = tn->second.n_elements ? tn->second.n_elements : (size_t)ggml_nelements(tensor);
+            apply_speed_metrics(tc);
             return tc;
         }
         {
@@ -1949,6 +2004,9 @@ static std::unordered_map<std::string, ggml_type> target_bpw_type(
             if (is_iq(t) && !valid_matrix) { continue; }
             ggml_type compat = make_compatible(tensor, t);
             if (!is_compatible(tensor, compat)) { continue; }
+            // Early filter: if a speed file is provided, drop types that are absent from it so that
+            // we don't pay for expensive quant/dequant error sampling on types we won't select.
+            if (dequant_costs && dequant_costs->find(compat) == dequant_costs->end()) { continue; }
             valid_types.push_back(compat);
             max_row_sz = std::max(max_row_sz, ggml_row_size(compat, n_per_row));
         }
@@ -2023,16 +2081,16 @@ static std::unordered_map<std::string, ggml_type> target_bpw_type(
 
         auto simplify_pareto = [&](std::vector<type_scores> & candidates) {
             std::sort(candidates.begin(), candidates.end(), [](const auto& a, const auto& b) {
-                return a.bytes < b.bytes || (a.bytes == b.bytes && a.error < b.error);
+                return a.bytes < b.bytes || (a.bytes == b.bytes && a.penalty < b.penalty);
             });
             candidates.erase(std::unique(candidates.begin(), candidates.end(),
                 [](const auto & a, const auto &b) { return a.bytes == b.bytes; }), candidates.end());
 
             std::vector<type_scores> hull;
-            double min_err = INFINITE;
+            double min_pen = INFINITE;
             for(const auto & c : candidates) {
-                if (c.error < min_err) {
-                    min_err = c.error;
+                if (c.penalty < min_pen) {
+                    min_pen = c.penalty;
                     hull.push_back(c);
                 }
             }
@@ -2041,7 +2099,7 @@ static std::unordered_map<std::string, ggml_type> target_bpw_type(
             if (candidates.size() < 3) { return; }
             std::vector<type_scores> convex;
             auto cross = [](const auto& a, const auto& b, const auto& c) {
-                return ((double)b.bytes - (double)a.bytes) * (c.error - a.error) - ((double)c.bytes - (double)a.bytes) * (b.error - a.error);
+                return ((double)b.bytes - (double)a.bytes) * (c.penalty - a.penalty) - ((double)c.bytes - (double)a.bytes) * (b.penalty - a.penalty);
             };
 
             for (const auto & c : candidates) {
@@ -2052,6 +2110,7 @@ static std::unordered_map<std::string, ggml_type> target_bpw_type(
             candidates = std::move(convex);
         };
 
+        apply_speed_metrics(ch);
         simplify_pareto(ch.candidates);
         ch.choice = 0;
         ch.min_bpw = ch.candidates.front().bpw;
@@ -2251,8 +2310,14 @@ static std::unordered_map<std::string, ggml_type> target_bpw_type(
         return build_mix();
     }
     if (budget_bytes >= max_total_bytes) {
-        for(auto & tn : all_tensors) { tn.choice = (int)tn.candidates.size() - 1; }
-        return build_mix();
+        // If speed optimization is enabled, we can't just pick the largest type.
+        // Cap the budget and let the Lagrangian find the best error/speed trade-off.
+        if (speed_importance > 0.0) {
+            budget_bytes = max_total_bytes;
+        } else {
+            for(auto & tn : all_tensors) { tn.choice = (int)tn.candidates.size() - 1; }
+            return build_mix();
+        }
     }
 
     // Certain tensors have a higher impact on model quality, so we apply a lower penalty to them
@@ -2265,7 +2330,7 @@ static std::unordered_map<std::string, ggml_type> target_bpw_type(
     // Determine tensor importance
     for (auto & tn : all_tensors) { tn.important = is_important(ggml_get_name(tn.w->tensor)); }
 
-    // Minimize error subject to a size target constraint
+    // Minimize the combined error/speed penalty subject to a size target constraint
     auto lagrangian_relaxation = [&](const double mu, std::vector<int> & choices, size_t & bytes, double & cost) {
         choices.resize(all_tensors.size());
         bytes = 0;
@@ -2276,7 +2341,7 @@ static std::unordered_map<std::string, ggml_type> target_bpw_type(
 
             int best = 0;
             for(int j = 1; j < (int)tn.candidates.size(); ++j) {
-                double lr = (tn.candidates[j].error - tn.candidates[best].error) + eff_mu * ((double)tn.candidates[j].bytes - (double)tn.candidates[best].bytes) * 8.0;
+                double lr = (tn.candidates[j].penalty - tn.candidates[best].penalty) + eff_mu * ((double)tn.candidates[j].bytes - (double)tn.candidates[best].bytes) * 8.0;
                 if (lr < -EPSILON || (std::abs(lr) <= EPSILON && tn.candidates[j].bytes < tn.candidates[best].bytes)) {
                     best = j;
                 }
@@ -2284,7 +2349,7 @@ static std::unordered_map<std::string, ggml_type> target_bpw_type(
 
             choices[i] = best;
             bytes += tn.candidates[best].bytes;
-            cost += tn.candidates[best].error;
+            cost += tn.candidates[best].penalty;
         }
     };
 
@@ -2371,10 +2436,11 @@ static std::unordered_map<std::string, ggml_type> target_bpw_type(
             const auto & tn = all_tensors[i];
             int next = tn.choice + 1;
             if (next < (int)tn.candidates.size()) {
-                const double err = std::max(0.0, tn.candidates[tn.choice].error - tn.candidates[next].error);
+                // Use the combined penalty so the greedy upgrade respects the speed/error trade-off
+                const double pen = std::max(0.0, tn.candidates[tn.choice].penalty - tn.candidates[next].penalty);
                 auto bytes = (double)(tn.candidates[next].bytes - tn.candidates[tn.choice].bytes);
                 if (bytes > EPSILON) {
-                    double ratio = err / bytes;
+                    double ratio = pen / bytes;
                     if (tn.important) { ratio *= boost; } // important tensors get a higher priority
                     queue.push({i, next, ratio});
                 }
@@ -2963,7 +3029,10 @@ llama_model_quantize_params llama_model_quantize_default_params() {
         /*.target_bpw                  =*/ -1.0f,
         /*.target_size                 =*/ -1,
         /*.state_file                  =*/ nullptr,
-        /*.upgrade_tensors             =*/ false
+        /*.upgrade_tensors             =*/ false,
+        /*.speed_importance            =*/ 0.0f,
+        /*.dequant_costs               =*/ nullptr,
+        /*.embedding_activeness        =*/ 1.0f,
     };
 
     return result;

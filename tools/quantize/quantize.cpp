@@ -110,6 +110,7 @@ static void usage(const char * executable) {
     printf("usage: %s [--help] [--allow-requantize] [--leave-output-tensor] [--pure] [--imatrix] [--include-weights]\n", executable);
     printf("       [--exclude-weights] [--output-tensor-type] [--token-embedding-type] [--tensor-type] [--tensor-type-file] [--prune-layers]\n");
     printf("       [--keep-split] [--override-kv] [--dry-run] [--target-bpw] [--target-size] [--maximize-budget-use] [--save-state] [--state-file]\n");
+    printf("       [--speed-importance] [--quant-speed-file] [--embedding-activeness]\n");
     printf("       model-f32.gguf [model-quant.gguf] type [nthreads]\n\n");
     printf("  --allow-requantize\n");
     printf("                                      allow requantizing tensors that have already been quantized\n");
@@ -161,8 +162,21 @@ static void usage(const char * executable) {
     printf("  --maximize-budget-use\n");
     printf("                                      upgrade tensors to higher precision to fit the size limit more tightly when using --target-bpw or --target-size\n");
     printf("                                      This will likely result in pareto dominated quantizations. Only use when you have an exact size limit (e.g. for specific hardware).\n\n");
+    printf("  --speed-importance n\n");
+    printf("                                      linear weight balancing inference speed vs quantization error (default: 0)\n");
+    printf("                                      e.g., 0.1 means 0.1 unit of dequant_cost is worth 0.1 units of quantization error\n");
+    printf("                                      requires --quant-speed-file and either --target-bpw or --target-size\n\n");
+    printf("  --quant-speed-file filename\n");
+    printf("                                      key=value file (INI-like) mapping quantization types to relative per-element inference times,\n");
+    printf("                                      e.g. \"q4_k=1.0\\nq8_0=1.7\\n...\". Types absent from the file are excluded from candidate selection.\n");
+    printf("                                      requires --target-bpw or --target-size\n\n");
+    printf("  --embedding-activeness n\n");
+    printf("                                      multiplier for token embedding activeness (default: 1.0)\n");
+    printf("                                      replaces the '1' in '1 / vocab_size' to scale embedding speed contribution\n\n");
     printf("note: --include-weights and --exclude-weights cannot be used together\n");
-    printf("      --target-bpw and --target-size cannot be used together\n\n");
+    printf("      --target-bpw and --target-size cannot be used together\n");
+    printf("      --speed-importance requires --quant-speed-file\n");
+    printf("      --quant-speed-file requires --target-bpw or --target-size\n\n");
     printf("-----------------------------------------------------------------------------\n");
     printf(" allowed quantization types\n");
     printf("-----------------------------------------------------------------------------\n\n");
@@ -504,6 +518,94 @@ static bool parse_target_size(const char * data, int64_t & target_size) {
     return true;
 }
 
+static bool parse_speed_importance(const char * data, float & speed_importance) {
+    if (!data) {
+        printf("\n%s: no speed importance value provided\n\n", __func__);
+        return false;
+    }
+
+    try {
+        speed_importance = std::stof(data);
+        if (!std::isfinite(speed_importance) || speed_importance < 0.0f) {
+            printf("\n%s: speed importance must be a non-negative finite number\n\n", __func__);
+            return false;
+        }
+    } catch (const std::exception &) {
+        printf("\n%s: '%s' is not a valid speed importance value\n\n", __func__, data);
+        return false;
+    }
+
+    return true;
+}
+
+// Parse an INI-like `quant=time` file into a map<ggml_type, double>.
+// Blank lines and lines starting with '#' or ';' are ignored.
+static bool parse_quant_speed_file(const char * path, std::unordered_map<ggml_type, double> & out) {
+    if (!path) {
+        printf("\n%s: no quant speed file provided\n\n", __func__);
+        return false;
+    }
+
+    std::ifstream in(path);
+    if (!in) {
+        printf("\n%s: failed to open quant speed file '%s'\n\n", __func__, path);
+        return false;
+    }
+
+    auto trim = [](std::string & s) {
+        const auto l = s.find_first_not_of(" \t\r\n");
+        const auto r = s.find_last_not_of(" \t\r\n");
+        if (l == std::string::npos) { s.clear(); } else { s = s.substr(l, r - l + 1); }
+    };
+
+    std::string line;
+    size_t line_no = 0;
+    while (std::getline(in, line)) {
+        ++line_no;
+        trim(line);
+        if (line.empty() || line[0] == '#' || line[0] == ';') { continue; }
+
+        const auto eq = line.find('=');
+        if (eq == std::string::npos) {
+            printf("\n%s: malformed entry at line %zu of '%s' (expected 'quant=time')\n\n", __func__, line_no, path);
+            return false;
+        }
+
+        std::string key = line.substr(0, eq);
+        std::string val = line.substr(eq + 1);
+        trim(key);
+        trim(val);
+
+        const ggml_type type = parse_ggml_type(key.c_str());
+        if (type == GGML_TYPE_COUNT) {
+            printf("\n%s: unknown quantization type '%s' at line %zu of '%s'\n\n", __func__, key.c_str(), line_no, path);
+            return false;
+        }
+
+        double time = 0.0;
+        try {
+            time = std::stod(val);
+        } catch (const std::exception &) {
+            printf("\n%s: invalid time '%s' for quant '%s' at line %zu of '%s'\n\n", __func__, val.c_str(), key.c_str(), line_no, path);
+            return false;
+        }
+
+        if (!std::isfinite(time) || time <= 0.0) {
+            printf("\n%s: time for quant '%s' at line %zu of '%s' must be a positive finite number\n\n", __func__, key.c_str(), line_no, path);
+            return false;
+        }
+
+        out[type] = time;
+    }
+
+    if (out.empty()) {
+        printf("\n%s: quant speed file '%s' contains no entries\n\n", __func__, path);
+        return false;
+    }
+
+    return true;
+}
+
 static const char * get_ftype(const float bpw) {
     const std::map<float, const char *> quant_bpw = {
         {1.5625, "IQ1_S"},
@@ -549,6 +651,10 @@ int llama_quantize(int argc, char ** argv) {
     std::vector<int> prune_layers;
     float target_bpw = -1.0f;
     int64_t target_size = -1;
+    float speed_importance = 0.0f;
+    float embedding_activeness = 1.0f;
+    std::string quant_speed_file;
+    std::unordered_map<ggml_type, double> dequant_costs_map;
 
     for (; arg_idx < argc && strncmp(argv[arg_idx], "--", 2) == 0; arg_idx++) {
         if (strcmp(argv[arg_idx], "--leave-output-tensor") == 0) {
@@ -610,6 +716,31 @@ int llama_quantize(int argc, char ** argv) {
             params.pure = true;
         } else if (strcmp(argv[arg_idx], "--maximize-budget-use") == 0) {
             params.upgrade_tensors = true;
+        } else if (strcmp(argv[arg_idx], "--speed-importance") == 0) {
+            if (arg_idx == argc-1 || !parse_speed_importance(argv[++arg_idx], speed_importance)) {
+                usage(argv[0]);
+            }
+        } else if (strcmp(argv[arg_idx], "--quant-speed-file") == 0) {
+            if (arg_idx == argc-1) {
+                usage(argv[0]);
+            }
+            quant_speed_file = argv[++arg_idx];
+            if (!parse_quant_speed_file(quant_speed_file.c_str(), dequant_costs_map)) {
+                usage(argv[0]);
+            }
+        } else if (strcmp(argv[arg_idx], "--embedding-activeness") == 0) {
+            if (arg_idx == argc-1) {
+                usage(argv[0]);
+            }
+            try {
+                embedding_activeness = std::stof(argv[++arg_idx]);
+                if (embedding_activeness < 0.0f) {
+                    printf("\n%s: embedding activeness must be non-negative\n\n", __func__);
+                    usage(argv[0]);
+                }
+            } catch (const std::exception &) {
+                usage(argv[0]);
+            }
         } else if (strcmp(argv[arg_idx], "--imatrix") == 0) {
             if (arg_idx < argc-1) {
                 imatrix_file = argv[++arg_idx];
@@ -643,6 +774,16 @@ int llama_quantize(int argc, char ** argv) {
         usage(argv[0]);
     }
     if (target_bpw != -1.0f && target_size != -1) {
+        usage(argv[0]);
+    }
+    const bool has_speed_file = !quant_speed_file.empty();
+    const bool has_target_budget = target_bpw != -1.0f || target_size != -1;
+    if (speed_importance > 0.0f && !has_speed_file) {
+        fprintf(stderr, "%s: --speed-importance requires --quant-speed-file\n", argv[0]);
+        usage(argv[0]);
+    }
+    if (has_speed_file && !has_target_budget) {
+        fprintf(stderr, "%s: --quant-speed-file requires --target-bpw or --target-size\n", argv[0]);
         usage(argv[0]);
     }
 
@@ -726,6 +867,12 @@ int llama_quantize(int argc, char ** argv) {
     }
     if (target_size != -1) {
         params.target_size = target_size;
+    }
+    params.speed_importance = speed_importance;
+    params.embedding_activeness = embedding_activeness;
+    if (!dequant_costs_map.empty()) {
+        // The map is owned by this stack frame and outlives the llama_model_quantize() call below.
+        params.dequant_costs = static_cast<const void *>(&dequant_costs_map);
     }
 
     llama_backend_init();
