@@ -109,7 +109,7 @@ static bool try_parse_ftype(const std::string & ftype_str_in, llama_ftype & ftyp
 static void usage(const char * executable) {
     printf("usage: %s [--help] [--allow-requantize] [--leave-output-tensor] [--pure] [--imatrix] [--include-weights]\n", executable);
     printf("       [--exclude-weights] [--output-tensor-type] [--token-embedding-type] [--tensor-type] [--tensor-type-file] [--prune-layers]\n");
-    printf("       [--keep-split] [--override-kv] [--dry-run] [--target-bpw] [--target-size] [--save-state] [--state-file]\n");
+    printf("       [--keep-split] [--override-kv] [--dry-run] [--target-bpw] [--target-size] [--maximize-budget-use] [--save-state] [--state-file]\n");
     printf("       model-f32.gguf [model-quant.gguf] type [nthreads]\n\n");
     printf("  --allow-requantize\n");
     printf("                                      allow requantizing tensors that have already been quantized\n");
@@ -158,6 +158,9 @@ static void usage(const char * executable) {
     printf("                                      allowed units: b, k|kib, m|mib, g|gib, t|tib; defaults to b (bytes) if none is provided\n\n");
     printf("  --state-file [filename]\n");
     printf("                                      file name to use/save; if none is provided, the default name will be used\n\n");
+    printf("  --maximize-budget-use\n");
+    printf("                                      upgrade tensors to higher precision to fit the size limit more tightly when using --target-bpw or --target-size\n");
+    printf("                                      This will likely result in pareto dominated quantizations. Only use when you have an exact size limit (e.g. for specific hardware).\n\n");
     printf("note: --include-weights and --exclude-weights cannot be used together\n");
     printf("      --target-bpw and --target-size cannot be used together\n\n");
     printf("-----------------------------------------------------------------------------\n");
@@ -605,6 +608,8 @@ int llama_quantize(int argc, char ** argv) {
             params.allow_requantize = true;
         } else if (strcmp(argv[arg_idx], "--pure") == 0) {
             params.pure = true;
+        } else if (strcmp(argv[arg_idx], "--maximize-budget-use") == 0) {
+            params.upgrade_tensors = true;
         } else if (strcmp(argv[arg_idx], "--imatrix") == 0) {
             if (arg_idx < argc-1) {
                 imatrix_file = argv[++arg_idx];

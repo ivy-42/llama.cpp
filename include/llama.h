@@ -422,6 +422,7 @@ extern "C" {
         float target_bpw;                                           // target bits per weight (bpw)
         int64_t target_size;                                        // target file size in bytes
         const char * state_file;                                    // pointer to bpw state file
+        bool upgrade_tensors;                                       // enable greedy upgrade of tensors to fill remaining budget after selecting Pareto-optimal quant mix
     } llama_model_quantize_params;
 
     typedef struct llama_logit_bias {

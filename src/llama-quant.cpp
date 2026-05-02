@@ -2347,54 +2347,56 @@ static std::unordered_map<std::string, ggml_type> target_bpw_type(
         for(auto& tn : all_tensors) { tn.choice = 0; }
     }
 
-    // Single pass greedy upgrade in case there is budget left
-    auto current_bytes = [&] {
-        size_t cb = 0;
-        for(const auto & tn : all_tensors) { cb += tn.candidates[tn.choice].bytes; }
-        return cb;
-    };
-    size_t cb = current_bytes();
+    if (qs.params->upgrade_tensors) {
+        // Single pass greedy upgrade in case there is budget left
+        auto current_bytes = [&] {
+            size_t cb = 0;
+            for(const auto & tn : all_tensors) { cb += tn.candidates[tn.choice].bytes; }
+            return cb;
+        };
+        size_t cb = current_bytes();
 
-    struct tensor_upgrade {
-        int index;
-        int next_choice;
-        double score;
-        bool operator<(const tensor_upgrade & other) const {
-            return score < other.score;
-        }
-    };
-
-    std::priority_queue<tensor_upgrade> queue;
-
-    auto push_next = [&](const int i) {
-        const auto & tn = all_tensors[i];
-        int next = tn.choice + 1;
-        if (next < (int)tn.candidates.size()) {
-            const double err = std::max(0.0, tn.candidates[tn.choice].error - tn.candidates[next].error);
-            auto bytes = (double)(tn.candidates[next].bytes - tn.candidates[tn.choice].bytes);
-            if (bytes > EPSILON) {
-                double ratio = err / bytes;
-                if (tn.important) { ratio *= boost; } // important tensors get a higher priority
-                queue.push({i, next, ratio});
+        struct tensor_upgrade {
+            int index;
+            int next_choice;
+            double score;
+            bool operator<(const tensor_upgrade & other) const {
+                return score < other.score;
             }
-        }
-    };
+        };
 
-    for (size_t i = 0; i < all_tensors.size(); ++i) { push_next((int)i); }
+        std::priority_queue<tensor_upgrade> queue;
 
-    while (!queue.empty()) {
-        auto top = queue.top();
-        queue.pop();
+        auto push_next = [&](const int i) {
+            const auto & tn = all_tensors[i];
+            int next = tn.choice + 1;
+            if (next < (int)tn.candidates.size()) {
+                const double err = std::max(0.0, tn.candidates[tn.choice].error - tn.candidates[next].error);
+                auto bytes = (double)(tn.candidates[next].bytes - tn.candidates[tn.choice].bytes);
+                if (bytes > EPSILON) {
+                    double ratio = err / bytes;
+                    if (tn.important) { ratio *= boost; } // important tensors get a higher priority
+                    queue.push({i, next, ratio});
+                }
+            }
+        };
 
-        int i = top.index;
-        int next = top.next_choice;
-        if (all_tensors[i].choice >= next) { continue; }
+        for (size_t i = 0; i < all_tensors.size(); ++i) { push_next((int)i); }
 
-        size_t delta_bt = all_tensors[i].candidates[next].bytes - all_tensors[i].candidates[all_tensors[i].choice].bytes;
-        if (cb + delta_bt <= budget_bytes) {
-            cb += delta_bt;
-            all_tensors[i].choice = next;
-            push_next(i);
+        while (!queue.empty()) {
+            auto top = queue.top();
+            queue.pop();
+
+            int i = top.index;
+            int next = top.next_choice;
+            if (all_tensors[i].choice >= next) { continue; }
+
+            size_t delta_bt = all_tensors[i].candidates[next].bytes - all_tensors[i].candidates[all_tensors[i].choice].bytes;
+            if (cb + delta_bt <= budget_bytes) {
+                cb += delta_bt;
+                all_tensors[i].choice = next;
+                push_next(i);
+            }
         }
     }
 
@@ -2960,7 +2962,8 @@ llama_model_quantize_params llama_model_quantize_default_params() {
         /*.prune_layers                =*/ nullptr,
         /*.target_bpw                  =*/ -1.0f,
         /*.target_size                 =*/ -1,
-        /*.state_file                  =*/ nullptr
+        /*.state_file                  =*/ nullptr,
+        /*.upgrade_tensors             =*/ false
     };
 
     return result;
